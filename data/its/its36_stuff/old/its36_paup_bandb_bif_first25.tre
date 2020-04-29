@@ -1,0 +1,39 @@
+#NEXUS 
+
+Begin trees;  [Treefile saved Sat Jun 12 19:56:00 2004]
+[!
+>Data file = W:\people\barbara\BandB\new\data\its\its36_stuff\get_successive_trees.nex
+>
+>Processing TREES block from file "W:\people\barbara\BandB\new\data\its\its36_paup_bandb_1bif.tre":
+>   Keeping: trees from file (replacing trees in memory)
+>   1 tree read from file
+]
+	Translate
+		1 T1,
+		2 T2,
+		3 T4,
+		4 T6,
+		5 T7,
+		6 T8,
+		7 T9,
+		8 T10,
+		9 T11,
+		10 T12,
+		11 T13,
+		12 T17,
+		13 T18,
+		14 T20,
+		15 T22,
+		16 T24,
+		17 T25,
+		18 T28,
+		19 T29,
+		20 T30,
+		21 T31,
+		22 T33,
+		23 T34,
+		24 T35,
+		25 T36
+		;
+tree PAUP_1 = [&U] (1,(2,(((3,4),14),(((((5,7),6),8),(((((9,10),11),13),12),((15,(((22,23),25),24)),(16,((18,(19,20)),21))))),17))));
+End;
