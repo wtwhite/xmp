@@ -1,0 +1,19 @@
+#NEXUS 
+
+Begin trees;
+	Translate
+		1 Lemur_catta,
+		2 Homo_sapiens,
+		3 Pan,
+		4 Gorilla,
+		5 Pongo,
+		6 Hylobates,
+		7 Macaca_fuscata,
+		8 M._mulatta,
+		9 M._fascicularis,
+		10 M._sylvanus,
+		11 Saimiri_sciureus,
+		12 Tarsius_syrichta
+		;
+tree BADER_2497 = [&U] (1,3,((4,5),(12,(((2,6),(10,(9,(7,8)))),11))));
+End;
