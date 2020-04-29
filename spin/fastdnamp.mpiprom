@@ -1,0 +1,1212 @@
+/* This is an mpi-spin model of the multiprocessor code for the fastdnamp
+ * program, which is mostly contained in mpiboss.c and mpiworker.c, with small
+ * amounts from yanbader.c and common.c.
+ *
+ * Rev 479 actually DOES model-check without errors, it just needs a search
+ * depth of 2559872!  See the SVN log for more details.
+ *
+ * $Id: fastdnamp.mpiprom 517 2010-04-18 10:40:51Z wtwhite $ */
+
+#include "mpi-spin.prom"
+
+/* CURSE spin's inability to parse constant expressions... */
+/*#define NWORKERS (NPROCS - 1)*/
+#if NWORKERS != NPROCS - 1
+#error You must #define NWORKERS to be NPROCS - 1!
+#endif
+#if NWORKERS_TIMES_2 != NWORKERS * 2
+#error You must #define NWORKERS_TIMES_2 to be NWORKERS * 2!
+#endif
+#if NWORKERS_SQUARED != NWORKERS * NWORKERS
+#error You must #define NWORKERS_SQUARED to be NWORKERS * NWORKERS!
+#endif
+
+/* Message tags used for both Boss -> Worker and Worker -> Boss MPI communication. */
+/* Stolen from enum message_type in common.h */
+/* NEW: For messages sent by workers to the boss, we have now combined MSG_ASKFORJOB and MSG_NEWBOUND into a single message
+ * type, MSG_WORKERREQUEST.  The payload will be 1 byte (or unsigned int in C) long
+ * if it indicates NEWBOUND (in which case that byte will contain the bound) or
+ * 0 bytes long if it indicates ASKFORJOB.  Combining these messages is needed
+ * to guarantee that they arrive in the order sent (otherwise
+ * deadlocks can occur).  It's just as important that MSG_NEWJOB remain a
+ * separate message type so that the boss can wait on it only while stealing. */
+/*#define MSG_ASKFORJOB 0*/			/* W -> B */
+#define MSG_WORKERREQUEST 0		/* W -> B (length 1 => W discovered a new UB; length 0 => W asking for work) */
+#define MSG_NEWJOB 1			/* B -> W (response to MSG_ASKFORJOB), W -> B (response to MSG_STEALJOB) */
+#define MSG_STEALJOB 2			/* B -> W */
+#define MSG_NEWBOUND 3			/* B -> W (B tells everyone the new UB).  Note Ws tell B about new UBs they find using MSG_WORKERREQUEST. */
+#define MSG_TREES 4				/* W -> B (raw text block of newline-delimited Newick-format trees, sent at the very end) */
+#define MAXMSGTYPE 5
+
+/* One item for each type of nonblocking MPI communication request that a worker can simultaneously have active.
+ * These are stored in the array mpiRequests of TreeData, followed by up to nWorkers more requests for handling
+ * the completion of sends of stolen jobs. */
+/* Stolen from enum worker_comm_requests in common.h */
+/* NEW: The only worker receive type is WCR_RCV_ALL.  Should get rid of all other WCR_RCV_* and drop MAX_WCR by 2. */
+#define WCR_RCV_ALL 0
+/*#define WCR_RCV_NEWJOB 0
+#define WCR_RCV_NEWBOUND 1
+#define WCR_RCV_STEALJOB 2*/
+#define WCR_SND_ASKFORJOB 1
+#define WCR_SND_NEWBOUND 2
+#define MAX_WCR 3
+
+
+/* Stolen from enum worker_state in mpiboss.c */
+#define HASWORK 0				/* To the best of our knowledge, this worker has work */
+#define NOWORKTOGIVE 1			/* This worker responded to a steal request in the negative, but hasn't asked for work yet */
+#define OUTOFWORK 2				/* This worker has requested more work */
+#define MAXWORKERSTATE 3
+
+/* td->nMpiRequests never changes after being assigned, so just use a constant. */
+#if NMPIREQUESTS != MAX_WCR + NWORKERS
+#error You must #define NMPIREQUESTS to be MAX_WCR + NWORKERS!
+#endif
+
+/* Amazingly, setting this to 1 results in compiler errors!  According to the docs for Promela, Spin
+   converts all arrays of size 1 to scalars, which is just a pain. */
+#define TREEBUFSIZE 2
+
+/* I believe that every printf() introduces a new state, which might bloat memory requirements and slow things down. */
+#ifdef NODBGPRINT
+#define DBGPRINT(x)
+#else	/* not NODBGPRINT */
+#define DBGPRINT(x) printf x;
+#endif	/* not NODBGPRINT */
+
+/* Simplify setting an array of MPI_Status values to undefined. */
+#define ClearStatuses(ps, n) c_code { MPI_setStatusesUndefined(n, ps); }
+
+/* Differences with the actual C code:
+ *
+ * - We don't actually record bounds.  MSG_NEWBOUND is just an MPI_POINT and we non-deterministically decide whether
+ *   or not the new bound is better.
+ * - When it comes to sending jobs: an MSG_NEWJOB, which is of type MPI_BYTE, is a job iff it has length 0, and it
+ *   means "no job to give" if it's length 1.  (Similar but different to how it works in the actual C code.)
+ */
+
+inline OutputResults() {
+	/* Retrieve tree data from workers in TREEBUFSIZE chunks. */
+	/* We need to serialise workers here in order to get all chunks from each worker in order, but the performance */
+	/* hit is too small to matter. */
+	i = 0;
+	do
+	::	i == NWORKERS ->
+		/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+		i = 0;
+		break;
+	::	else ->
+		DBGPRINT(("B: Waiting for W%04d to send us its tree data.\n", i + 1))
+#ifdef SIMPLEOUTPUTRESULTS
+		/* A simpler variant. */
+		MPI_Recv(Pboss, NULL, 0, MPI_POINT, Pboss->i + 1, MSG_TREES, MPI_STATUS_IGNORE);
+		DBGPRINT(("B: Received DONTCARE bytes of tree data from W%04d.\n", i + 1))
+#else	/* not SIMPLEOUTPUTRESULTS */
+		byte treeBuf[TREEBUFSIZE];
+		MPI_Status outputResultsMpiStatus;		/* Renamed from original (even though it doesn't appear in boss(), it looks like it could so let's be clear) */
+		
+		count = TREEBUFSIZE;		/* Prime the loop */
+		do
+		::	count == TREEBUFSIZE ->
+			/* Multi-processor: read a block from the ith worker. */
+			MPI_Recv(Pboss, Pboss->treeBuf, TREEBUFSIZE, MPI_BYTE, Pboss->i + 1, MSG_TREES, &Pboss->outputResultsMpiStatus);
+			MPI_Get_count(&Pboss->outputResultsMpiStatus, MPI_BYTE, &Pboss->count);
+			DBGPRINT(("B: Received %d bytes of tree data from W%04d.\n", count, i + 1))
+		::	else ->			/* A read of less than TREEBUFSIZE means we're finished. */
+			break;
+		od;
+#endif	/* not SIMPLEOUTPUTRESULTS */
+		
+		i++;
+	od;
+}
+
+BEGIN_ACTIVE_MPI_PROC(boss, 1)
+	byte stateCount[MAXWORKERSTATE];
+	byte state[NWORKERS];
+	bool finished[NWORKERS];
+	byte i, j;
+	byte jobBuf[NWORKERS];		/* Each job is represented by a 1-byte flag: 1 == a job, 0 == no job */
+	MPI_Status mpiStatuses[NWORKERS];		/* Ugh. */			/* NEW: Only need NWORKERS entries now! */
+	MPI_Request workerListenRequests[NWORKERS];			/* NEW: Only need NWORKERS entries now! */
+	byte indices[NWORKERS];			/* NEW: Only need NWORKERS entries now! */
+	byte nRequests;
+	bool foundBetterUB;
+	byte nJobRequests;
+	byte nFinished = 0;
+	MPI_Request boundBroadcastRequests[NWORKERS];
+	/*MPI_Status boundBroadcastStatuses[NWORKERS];*/		/* Don't need since we don't care about these statuses */
+	byte nStealRequests;
+	byte victim;		/* Could possibly reuse j for this since I don't think the scopes overlap */
+	byte thieves[NWORKERS];
+	MPI_Request stealRequestsAndResponses[NWORKERS_TIMES_2];
+	byte k;				/* Actually we DO need k distinct from j.  Damn. */
+	MPI_Status stealRequestOrResponseStatus;
+	byte nForwardRequests;
+	MPI_Request forwardRequests[NWORKERS];
+	/*MPI_Status forwardStatuses[NWORKERS];*/		/* Don't need since we don't care about these statuses */
+	byte count;
+	byte workerMsgBufs[NWORKERS];			/* Will hold received UBs (if the worker sends a UB) */
+	
+	MPI_Init(Pboss, Pboss->_pid);
+	
+#ifdef ATOMICBOSS
+	/* It seems likely that it is totally safe to do this, since the effects from all sends and receives is
+	 * simply postponed to the corresponding wait call.  Unfortunately the same can't be done for worker(),
+	 * since it contains MPI_Test() calls that cause spin to go into a weird infinite loop (Why???  I thought
+	 * spin was supposed to be able to detect states it has already visited...) */
+	atomic {
+#endif	/* ATOMICBOSS */
+
+	/* Initialisation */
+	d_step {
+		stateCount[HASWORK] = 0;
+		stateCount[NOWORKTOGIVE] = 0;
+		stateCount[OUTOFWORK] = NWORKERS;
+		
+		i = 0;
+		do
+		::	i == NWORKERS ->
+			break;
+		::	else ->
+			state[i] = OUTOFWORK;
+			finished[i] = 0;
+			i++;
+		od;
+		
+		/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+		ClearStatuses(Pboss->mpiStatuses, NWORKERS);
+		ClearStatuses(&Pboss->stealRequestOrResponseStatus, 1);
+		
+		i = 0;
+		do
+		::	i == NWORKERS ->
+			break;
+		::	else ->
+			boundBroadcastRequests[i] = MPI_REQUEST_NULL;
+			stealRequestsAndResponses[i] = MPI_REQUEST_NULL;
+			stealRequestsAndResponses[i + NWORKERS] = MPI_REQUEST_NULL;
+			forwardRequests[i] = MPI_REQUEST_NULL;
+			i++;
+		od;
+		
+		i = 0;
+	}
+	
+	/* Waiting for 1st request */
+	DBGPRINT(("B: Waiting for the 1st request...\n"))
+	MPI_Recv(Pboss, Pboss->jobBuf, 1, MPI_BYTE, MPI_ANY_SOURCE, MSG_WORKERREQUEST, Pboss->mpiStatuses);		/* Use jobBuf arbitrarily */
+	DBGPRINT(("B: Received 1st request from W%d.\n", mpiStatuses[0].source))
+	MPI_Get_count(Pboss->mpiStatuses, MPI_BYTE, &Pboss->count);
+	assert(count == 0);		/* Not in the C code (yet).  Check that the first request is for work (obviously it can't be a new UB...) */
+	
+	/* Give the entire problem to the 1st worker that asks for it! */
+	/* The entire problem looks like 0-length list of edge ranges. */
+	MPI_Send(Pboss, Pboss->jobBuf, 0, MPI_BYTE, Pboss->mpiStatuses[0].source, MSG_NEWJOB);		/* Buffer is unimportant */
+	d_step {
+		state[mpiStatuses[0].source - 1] = HASWORK;		/* Would be nice if mpi-spin documented that the MPI_SOURCE field is named "source"... */
+		stateCount[OUTOFWORK]--;
+		stateCount[HASWORK]++;
+		
+		/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+		ClearStatuses(Pboss->mpiStatuses, 1);
+	}
+	
+	/* Wait for requests from all workers.  Each request has at most 1 unsigned int of data. */
+	i = 0;
+	do
+	::	i == NWORKERS ->
+		break;
+	::	else ->
+		/* Tricky: Need to wait separately on each type of message from workers, since if we use MPI_ANY_TAG */
+		/* we may inadvertently grab a MSG_NEWJOB after asking the worker for a job later on. */
+		/* Another way to do this would be to have a single MSG_WORKERREQUEST tag, and supply the type of request */
+		/* (either a new UB or a request for more work) as data.  That would save on MPI resources.  But having */
+		/* separate comm. objects for each tag type is more flexible so let's do that for now ;) */
+		/* Waiting on separate objects does mean that at completion time, each worker needs to send in a */
+		/* dummy message of each type. */
+		/* NEW: We now just use a single tag for receiving both new UBs and requests for work from workers.  As
+		 * explained at the top, this is needed to guarantee that these messages arrive in order, which in turn is
+		 * needed to avoid deadlock. */
+		/*MPI_Irecv(workerMsgBufs + i, 1, MPI_UNSIGNED, i + 1, MPI_ANY_TAG, MPI_COMM_WORLD, workerListenRequests + i); */
+		MPI_Irecv(Pboss, Pboss->workerMsgBufs + Pboss->i, 1, MPI_BYTE, Pboss->i + 1, MSG_WORKERREQUEST, Pboss->workerListenRequests + Pboss->i);
+		i++;
+	od;
+
+	/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+	i = 0;
+	
+	/* Now wait for further work requests to come in. */
+	/*while (stateCount[HASWORK]) { */
+	do
+	::	nFinished >= NWORKERS ->
+		break;
+	::	else ->
+		/* Use MPI_Waitsome() for fairness. */
+		/*int MPI_Waitsome(int incount, MPI_Request *array_of_requests, int *outcount, int *array_of_indices, MPI_Status *array_of_statuses) */
+		MPI_Waitsome(Pboss, NWORKERS, Pboss->workerListenRequests, &Pboss->nRequests, Pboss->indices, Pboss->mpiStatuses);
+		DBGPRINT(("B: %d requests have arrived.\n", nRequests))
+
+		/* Gather up any new upper bounds, and mark all work-requesting processes as OUTOFWORK */
+		foundBetterUB = 0;
+		nJobRequests = 0;
+		i = 0;
+		do
+		::	i == nRequests ->
+			break;
+		::	else ->
+			/* Length == 0 => ASKFORJOB; length == 1 => NEWBOUND. */
+			MPI_Get_count(Pboss->mpiStatuses + Pboss->i, MPI_BYTE, &Pboss->count);
+			
+			DBGPRINT(("B: Request %d is from W%d and has tag %d.  Count = %d.  Index = %d.\n", i, mpiStatuses[i].source, mpiStatuses[i].tag, count, indices[i]))
+			assert(mpiStatuses[i].tag == MSG_WORKERREQUEST);		/* Seems a bit pointless now... */
+
+			/* Actually, we don't want to do this here -- we want to wait and see whether this is an */
+			/* unsuccessful steal request.  We only post a new pending receive if it is not. */
+			/*// First, regardless of what happens: post a new pending receive to replace the one just used up. */
+			/*MPI_Irecv(workerMsgBufs + indices[i], 1, MPI_UNSIGNED, indices[i] + 1, mpiStatuses[i].MPI_TAG, MPI_COMM_WORLD, workerListenRequests + i); */
+
+			/* Is this a UB update? */
+			if
+			::	count == 1 ->			/* Note that in the model, we actually ignore the sent value. */
+				/* Nondeterministically decide whether the new bound is better */
+				if
+				::	true ->		/* It could be... */
+					DBGPRINT(("B: W%d reported a better bound of DONTCARE!\n", mpiStatuses[i].source))
+					foundBetterUB = 1;
+				::	true ->		/* Or, it might not be... */
+					DBGPRINT(("B: W%d reported a bound of DONTCARE, but we're as good or better already.\n", mpiStatuses[i].source))
+				fi;
+			::	else		/* Do nothing */
+			fi;
+
+			/* Is this a request for more work?  If so, we need to record it now in a first pass, before making */
+			/* steal attempts, to avoid trying to steal from a worker that is requesting work. */
+			if
+			::	count == 0 ->
+				DBGPRINT(("B: W%d asked for more work.\n", mpiStatuses[i].source))
+				/* The following assert() is incorrect -- every worker except the one who grabs the very first */
+				/* job initially has status OUTOFWORK. */
+				/*assert(state[indices[i]] != OUTOFWORK); */
+
+				stateCount[state[indices[i]]]--;
+				state[indices[i]] = OUTOFWORK;
+				stateCount[state[indices[i]]]++;
+				nJobRequests++;
+			::	else		/* Do nothing */
+			fi;
+			
+			i++;
+		od;
+		
+		/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+		i = 0;
+		count = 0;
+		
+		DBGPRINT(("B: After 1st pass, worker states are: %d in HASWORK, %d in NOWORKTOGIVE, %d in OUTOFWORK.\n",
+			stateCount[HASWORK],
+			stateCount[NOWORKTOGIVE],
+			stateCount[OUTOFWORK]
+		))
+
+		/* If a better UB was found, tell everyone who hasn't finished yet. */
+		/*HACK: Could avoid telling workers who we know have at least as good a bound, but who cares... */
+		if
+		::	foundBetterUB ->
+			DBGPRINT(("B: A better bound of DONTCARE was reported this round.\n"))
+			j = 0;
+			i = 0;
+			do
+			::	i == NWORKERS ->
+				break;
+			::	else ->
+				if
+				::	!finished[i] ->
+					/* NEW: Since we use a single receive request on the worker side, try using consistent types (MPI_BYTE) for all sends. */
+					MPI_Isend(Pboss, NULL, 0, MPI_BYTE, Pboss->i + 1, MSG_NEWBOUND, Pboss->boundBroadcastRequests + Pboss->j);		/* Was MPI_Issend() */
+					j++;
+				::	else		/* Do nothing */
+				fi;
+				i++;
+			od;
+
+			/* This assert caught a BUG in the C code: There (as here, originally) we update nFinished but not individual items in finished[]! */
+			assert(j == NWORKERS - nFinished);		/* Not in the original C code but seems a good idea */
+			
+			/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+			i = 0;
+			j = 0;
+			
+			/* The following MPI_Waitall() implies that unfinished workers must be able to receive a new bound at any */
+			/* time -- otherwise we'll deadlock. */
+			DBGPRINT(("B: Waiting for new bound to be sent to all %d unfinished workers.\n", NWORKERS - nFinished))
+			MPI_Waitall(Pboss, NWORKERS - Pboss->nFinished, Pboss->boundBroadcastRequests, MPI_STATUSES_IGNORE);
+		::	else		/* Do nothing */
+		fi;
+
+		/* Handle all other requests, which should be for more work. */
+		/* Because we already updated the states of work-requesting workers in a previous pass, */
+		/* we will never make a steal request to a worker which is itself making a steal request this round. */
+		/* It also simplifies thinking about the logic to know that the set of all thieves is disjoint from */
+		/* the set of all victims. */
+		nStealRequests = 0;
+		i = 0;
+		do
+		::	i == nRequests ->
+			/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+			i = 0;
+			break;
+		::	else ->
+			MPI_Get_count(Pboss->mpiStatuses + Pboss->i, MPI_BYTE, &Pboss->count);			/* Need to recompute this... */
+			if
+			::	count == 0 ->
+				assert(state[indices[i]] == OUTOFWORK);			/* First pass establishes this. */
+
+				if
+				::	!stateCount[HASWORK] ->
+					/* We're done! */
+					/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+					i = 0;
+					break;
+				::	else		/* Do nothing */
+				fi;
+
+				/* Pick a random worker and try to steal a job from them. */
+				/* Although we only pick from among workers with status HASWORK, it could well be that */
+				/* the worker chosen was just about to run out of work and now has, so the steal could fail. */
+				/* Do this via nondeterministic choice.  This loop is a bit different than how it works
+				   in the C code -- we don't use a random number.  Have to be careful to make sure we choose
+				   a valid victim at all! */
+				/* Must use atomic block instead of d_step because it contains nondet. */
+#if NWORKERS == 2
+				victim = 1 - indices[i];		/* Faster in this special case */
+#else	/* NWORKERS != 2 */
+				victim = 0;
+				j = stateCount[HASWORK];
+				atomic {
+					do
+					::	j == 0 ->
+						break;
+					::	else ->
+						if
+						::	state[victim] == HASWORK ->
+							/* Here's where we choose nondeterministically. */
+							if
+							::	true ->		/* We can skip past this one (or choose it if it's the last one)... */
+								j--;
+							::	true ->		/* Or choose this one. */
+								j = 0;
+							fi;
+						::	else		/* Do nothing */
+						fi;
+						
+						victim++;
+					od;
+				}
+				victim--;
+				
+				/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+				j = 0;
+#endif	/* NWORKERS != 2 */
+
+				/* Workers that we're attempting to steal from may try to send ASKFORJOB requests or NEWBOUNDs */
+				/* of their own, but we're only interested in the response to the STEALJOB attempt.  Because */
+				/* MPI doesn't allow receiving of partial wildcards, that means we need to ask for only MSG_NEWJOB */
+				/* responses, and encode "can't satisfy the steal" in this somehow, rather than use a different */
+				/* message type to indicate this. */
+				/* Tricky: jobBuf elements have type unsigned [2], so pointer arithmetic implicitly multiplies by 2. */
+				/* We use stealRequestsAndResponses to hold statuses for both the steal request sent to the victim and */
+				/* the response.  By always putting the latter first, we can quickly check whether a completed */
+				/* communication refers to a send or receive with a simple index comparison, and in the important case */
+				/* of a receive, thieves[index] is the relevant thief. */
+				DBGPRINT(("B: Attempting to steal from W%d to give to W%d.\n", victim + 1, indices[i] + 1))
+				MPI_Isend(Pboss, NULL, 0, MPI_BYTE, Pboss->victim + 1, MSG_STEALJOB, Pboss->stealRequestsAndResponses + Pboss->nJobRequests + Pboss->nStealRequests);		/* Was MPI_Issend() */
+				MPI_Irecv(Pboss, Pboss->jobBuf + Pboss->indices[Pboss->i], 1, MPI_BYTE, Pboss->victim + 1, MSG_NEWJOB, Pboss->stealRequestsAndResponses + Pboss->nStealRequests);
+				
+				/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+				victim = 0;
+				
+				thieves[nStealRequests] = indices[i];
+				nStealRequests++;
+			::	else ->		/* Do nothing (well not quite... in fact we trim the state space) */
+				/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+				count = 0;
+			fi;
+			
+			i++;
+		od;
+		
+		DBGPRINT(("B: Initial number of steal requests: %d\n", nStealRequests))
+
+		/* Repeatedly wait for the outcome of steal requests, and make new ones for any that failed. */
+		do
+		::	nStealRequests == 0 ->
+			break;
+		::	else ->
+			/* At this point, there should be nStealRequests outgoing MSG_STEALJOBs pending, and the same number of */
+			/* MSG_NEWJOB receives pending. */
+
+			/* See whether our steal requests worked. */
+
+			/* First pass: record all failed steals.  This avoids wastefully requesting multiple further steals */
+			/* from workers that have already run out of work. */
+			/* We also perform forwarding here for successful steals.  This is important as the successful thieves go back */
+			/* to having HASWORK state, meaning they themselves can be stolen from in the next round of re-attempts.  If */
+			/* we didn't do this, workers may starve. */
+			/* This loop waits for both the sends and receives, hence the "* 2". */
+			nForwardRequests = 0;
+			i = 0;
+			do
+			::	i == nStealRequests * 2 ->
+				break;
+			::	else ->
+				MPI_Waitany(Pboss, Pboss->nJobRequests * 2, Pboss->stealRequestsAndResponses, &Pboss->k, &Pboss->stealRequestOrResponseStatus);
+
+				if
+				::	k < nJobRequests ->		/* Otherwise, a steal request has completed: big deal. */
+					/* A steal response has been received.  In this case, thieves[k] will be the relevant thief. */
+					MPI_Get_count(&Pboss->stealRequestOrResponseStatus, MPI_BYTE, &Pboss->count);
+					if
+					::	count == 1 ->
+						/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+						count = 0;
+						
+						/* Steal request can't be satisfied.  Try another one. */
+						DBGPRINT(("B: Steal from W%d to give to W%d FAILED.  Will re-attempt if some workers have work left.\n", stealRequestOrResponseStatus.source, thieves[k] + 1))
+
+						/*HACK: Some code near-duplication follows. */
+						/* Although we only asked workers with status HASWORK, it might be that > 1 steal request went to */
+						/* the same worker, and one of these requests could not be satisfied.  So it's possible that */
+						/* the victim's state is already NOWORKTOGIVE. */
+						assert(state[stealRequestOrResponseStatus.source - 1] == HASWORK || state[stealRequestOrResponseStatus.source - 1] == NOWORKTOGIVE);
+						stateCount[state[stealRequestOrResponseStatus.source - 1]]--;
+						state[stealRequestOrResponseStatus.source - 1] = NOWORKTOGIVE;
+						stateCount[state[stealRequestOrResponseStatus.source - 1]]++;
+					::	else ->
+						/* The steal request can be satisfied.  Forward the job to the thief. */
+						DBGPRINT(("B: Steal from W%d to give to W%d SUCCEEDED (job tree size = DONTCARE).  Forwarding.\n", stealRequestOrResponseStatus.source, thieves[k] + 1))
+						MPI_Isend(Pboss, Pboss->jobBuf + Pboss->thieves[Pboss->k], Pboss->count, MPI_BYTE, Pboss->thieves[Pboss->k] + 1, MSG_NEWJOB, Pboss->forwardRequests + Pboss->nForwardRequests);		/* Was MPI_Issend() */
+						nForwardRequests++;
+
+						stateCount[state[thieves[k]]]--;
+						state[thieves[k]] = HASWORK;
+						stateCount[state[thieves[k]]]++;
+					fi;
+				::	else		/* Do nothing */
+				fi;
+				
+				/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+				ClearStatuses(&Pboss->stealRequestOrResponseStatus, 1);
+				k = 0;
+				
+				i++;
+			od;
+
+			/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+			i = 0;
+			
+			/* Wait for all stolen jobs to be forwarded to successful thieves.  This must be done before allowing */
+			/* attempts to steal from these successful ex-thieves, since otherwise such a steal request may fail */
+			/* due to the forwarding operation not having completed yet.  The victim would then be marked as NOWORKTOGIVE, */
+			/* meaning that the job it had just stolen would effectively "disappear off the radar".  This would not */
+			/* make the algorithm incorrect, but risks overloading some workers while starving others. */
+
+			/* The following MPI_Waitall() implies that all workers who asked for more work must be able to receive */
+			/* those jobs without blocking. */
+			DBGPRINT(("B: Waiting for %d forwarded jobs to be sent to workers.\n", nForwardRequests))
+			MPI_Waitall(Pboss, Pboss->nForwardRequests, Pboss->forwardRequests, MPI_STATUSES_IGNORE);		/* We don't care about the statuses in the model */
+
+			if
+			::	!stateCount[HASWORK] ->
+				DBGPRINT(("B: No more workers with work to give!\n"))
+				break;
+			::	else		/* Do nothing */
+			fi;
+
+			/* Second pass: attempt re-stealing of all failed steals.  Again, the previous pass */
+			/* ensures that we have that thieves are disjoint from victims.  We also know that there is at least */
+			/* 1 worker in state HASWORK who it is worth attempting to steal from, since we exit the loop above */
+			/* if there are none left, and state counts are not changed by the loop below. */
+			/* Note that all steals could fail even though computation is not complete -- it may be that some workers */
+			/* with state HASWORK were not chosen as victims in the previous round of steal attempts. */
+			k = 0;					/* k is the location to write the next re-steal request */
+			i = 0;
+			do
+			::	i == nStealRequests ->
+				break;
+			::	else ->
+				/* "Can't satisfy the steal" is encoded as a length-1 response.  Normally, all jobs have even length */
+				/* as they are an array of pairs. */
+				if
+				::	state[thieves[i]] == OUTOFWORK ->
+					/* Steal request couldn't be satisfied.  Try another one. */
+
+					/* Pick a random worker and try to steal a job from them. */
+					/* Although we only pick from among workers with status HASWORK, it could well be that */
+					/* the worker chosen was just about to run out of work and now has, so the steal could fail. */
+					/* Do this via nondeterministic choice.  This loop is a bit different than how it works
+					   in the C code -- we don't use a random number.  Have to be careful to make sure we choose
+					   a valid victim at all! */
+					/* Must use atomic block instead of d_step because it contains nondet. */
+#if NWORKERS == 2
+					victim = 1 - thieves[i];		/* Faster in this special case.  Note the slight difference from 1st-round victim selection. */
+#else	/* NWORKERS != 2 */
+					victim = 0;
+					j = stateCount[HASWORK];
+					atomic {
+						do
+						::	j == 0 ->
+							break;
+						::	else ->
+							if
+							::	state[victim] == HASWORK ->
+								/* Here's where we choose nondeterministically. */
+								if
+								::	true ->		/* We can skip past this one (or choose it if it's the last one)... */
+									j--;
+								::	true ->		/* Or choose this one. */
+									j = 0;
+								fi;
+							::	else		/* Do nothing */
+							fi;
+							
+							victim++;
+						od;
+					}
+					victim--;
+					
+					/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+					j = 0;
+#endif	/* NWORKERS != 2 */
+
+					/* Tricky: in order to be able to reuse the job buffers for forwarding the jobs to the workers */
+					/* if and when they are successfully stolen, we need to always use the same job buffer for each */
+					/* thief.  That means using the thieves[i]-th buffer, not the ith -- otherwise later iters of */
+					/* this loop can overwrite received jobs that are waiting to be forwarded. */
+					DBGPRINT(("B: Re-attempting to steal from W%d to give to W%d.\n", victim + 1, thieves[i] + 1))
+					MPI_Isend(Pboss, NULL, 0, MPI_BYTE, Pboss->victim + 1, MSG_STEALJOB, Pboss->stealRequestsAndResponses + Pboss->nJobRequests + Pboss->k);		/* The buffer isn't used */		/* Was MPI_Issend() */
+					MPI_Irecv(Pboss, Pboss->jobBuf + Pboss->thieves[Pboss->i], 1, MPI_BYTE, Pboss->victim + 1, MSG_NEWJOB, Pboss->stealRequestsAndResponses + Pboss->k);
+					
+					/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+					victim = 0;
+					
+					thieves[k] = thieves[i];
+					k++;
+				::	else		/* Do nothing */
+				fi;
+				
+				i++;
+			od;
+
+			/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+			i = 0;
+			
+			nStealRequests = k;
+			
+			/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+			k = 0;
+		od;
+
+		/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+		nJobRequests = 0;
+		d_step {
+			i = 0;
+			do
+			::	i == NWORKERS ->
+				break;
+			::	else ->
+				thieves[i] = 0;
+				i++;
+			od;
+			
+			i = 0;
+		};
+		
+		/* For each thief, the possible state transitions during the above "while (nStealRequests) { ... }" loop are: */
+		/* */
+		/* OUTOFWORK (only possible if all steal attempts failed and there are no more HASWORK workers to steal from; */
+		/*    in this case, the thief will still be waiting for a response to its ASKFORJOB request) */
+		/* OUTOFWORK->HASWORK (a steal attempt succeeded; job forwarding has been completed; possibly other thieves later */
+		/*    stole successfully from us) */
+		/* OUTOFWORK->HASWORK->NOWORKTOGIVE (a steal attempt succeeded; job forwarding has been completed; */
+		/*    >= 1 other thieves later stole unsuccessfully from us) */
+		/* */
+		/* In all cases, stateCount[HASWORK] == 0 iff some thief could not be satisfied.  This is the termination condition. */
+		/* An equivalent termination condition is if any of the workers whose requests were processed in this round */
+		/* now has state OUTOFWORK.  (Other workers may have OUTOFWORK status -- e.g. near the start when not */
+		/* all initial requests have been processed.) */
+		/*TODO: find a way to assert() this.  The assert() below is wrong because it doesn't account for other workers */
+		/* who didn't have requests processed during this round. */
+/*		assert((stateCount[HASWORK] == 0) == (stateCount[OUTOFWORK] > 0)) -------  THIS IS WRONG */
+
+		DBGPRINT(("B: After 2nd pass, worker states are: %d in HASWORK, %d in NOWORKTOGIVE, %d in OUTOFWORK.\n",
+			stateCount[HASWORK],
+			stateCount[NOWORKTOGIVE],
+			stateCount[OUTOFWORK]
+		))
+
+		/* 3rd and final pass, telling unsuccessful thieves that it's all over. */
+		/* We also reinstate receives for any other requests that we just "used up". */
+		nForwardRequests = 0;	/* Re-use to count the number of "finished" messages sent */
+		i = 0;
+		do
+		::	i == nRequests ->
+			break;
+		::	else ->
+			/* Determine which worker we are talking about.  Remember we have two */
+			/* requests pending for each. */
+			j = indices[i] + 1;			/* NEW: Don't need "%" now that we only have NWORKERS requests.  TODO: Get rid of this completely. */
+			assert(j == mpiStatuses[i].source);		/* Not in the C code but seems like a good idea */
+			MPI_Get_count(Pboss->mpiStatuses + Pboss->i, MPI_BYTE, &Pboss->count);
+			DBGPRINT(("B: 3rd pass: looking at request %d, index %d, from W%d (in state %d), of tag %d, length %d.\n", i, indices[i], j, state[j - 1], mpiStatuses[i].tag, count))
+			if
+			::	count == 0 && state[j - 1] == OUTOFWORK ->
+				/* We were unable to perform a steal for this thief.  Tell them we're finished. */
+				/* This will be the last message sent to this worker during this loop.  This is an */
+				/* important property to guarantee, since otherwise the worker doesn't know whether to */
+				/* wait for more NEWBOUND or STEALJOB requests. */
+				assert(stateCount[HASWORK] == 0);
+				DBGPRINT(("B: Unable to perform a steal for W%d, and there are no more potential victims.  Telling thief we're finished.\n", j)) 
+				MPI_Isend(Pboss, Pboss->jobBuf + Pboss->j - 1, 1, MPI_BYTE, Pboss->mpiStatuses[Pboss->i].source, MSG_NEWJOB, Pboss->forwardRequests + Pboss->nForwardRequests);		/* Was MPI_Issend() */
+				finished[mpiStatuses[i].source - 1] = 1;		/* BUG in the C code: This line needs to be added! */
+				nForwardRequests++;
+			::	else ->
+				/* Reinstate this pending receive. */
+				/*HACK: Look at that modulo operator...  Yuck. */
+				/* NEW: We now use a single, 1-byte receive for both ASKNEWJOB and NEWBOUND requests from workers. */
+				MPI_Irecv(Pboss, Pboss->workerMsgBufs + Pboss->indices[Pboss->i], 1, MPI_BYTE, Pboss->j, MSG_WORKERREQUEST, Pboss->workerListenRequests + Pboss->indices[Pboss->i]);
+			fi;
+			
+			i++;
+		od;
+
+		/* Reduce the state space by clearing out indices and mpiStatuses so they can't affect subsequent loop iters. */
+		i = 0;		/* Moved before d_step just to enable "break" from previous loop */
+		d_step {
+			do
+			::	i == NWORKERS ->
+				break;
+			::	else ->
+				indices[i] = 0;
+				ClearStatuses(Pboss->mpiStatuses + Pboss->i, 1);
+				i++;
+			od;
+			
+			/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+			i = 0;
+			j = 0;
+			count = 0;
+			nRequests = 0;
+		};
+		
+		MPI_Waitall(Pboss, Pboss->nForwardRequests, Pboss->forwardRequests, MPI_STATUSES_IGNORE);		/* Don't care about the statuses */
+		nFinished = nFinished + nForwardRequests;
+		
+		/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+		nForwardRequests = 0;
+	od;
+	
+	/*DEBUG: To keep the state space small, check that all variables are at their "defaults". */
+	assert(stateCount[HASWORK] == 0);
+	d_step {
+		assert(stateCount[OUTOFWORK] == NWORKERS);
+		assert(stateCount[NOWORKTOGIVE] == 0);
+		
+		assert(i == 0);
+		assert(j == 0);
+		
+		i = 0;
+		do
+		::	i == NWORKERS ->
+			break;
+		::	else ->
+			assert(state[i] == OUTOFWORK);
+			assert(finished[i]);
+			assert(jobBuf[i] == 0);
+			
+			assert(c_expr { MPI_isUndefinedStatus(Pboss->mpiStatuses + Pboss->i) });
+			
+			assert(workerListenRequests[i] == MPI_REQUEST_NULL);
+			assert(boundBroadcastRequests[i] == MPI_REQUEST_NULL);
+			assert(indices[i] == 0);
+			assert(thieves[i] == 0);
+			assert(stealRequestsAndResponses[i] == MPI_REQUEST_NULL);
+			assert(stealRequestsAndResponses[i + NWORKERS] == MPI_REQUEST_NULL);
+			assert(forwardRequests[i] == MPI_REQUEST_NULL);
+			assert(workerMsgBufs[i] == 0);
+			i++;
+		od;
+		
+		/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+		i = 0;
+		
+		assert(c_expr { MPI_isUndefinedStatus(&Pboss->stealRequestOrResponseStatus) });
+		
+		assert(nRequests == 0);
+		assert(foundBetterUB == 0);
+		assert(nJobRequests == 0);
+		assert(nFinished == NWORKERS);
+		assert(nStealRequests == 0);
+		assert(victim == 0);
+		assert(k == 0);
+		assert(nForwardRequests == 0);
+		assert(count == 0);
+	};
+	
+	DBGPRINT(("B: Main loop has finished.\n"))
+	
+	/* All workers have been sent a "finished" message.  They are still all waiting on NEWBOUND and STEALJOB */
+	/* receives, however. */
+	
+	/* Send the final bound to each worker (this may well have changed since the time that worker was sent "finished"). */
+	/* Also send a dummy STEALJOB request.  This is just to consume each worker's pending receive on this message type, meaning */
+	/* we can avoid having to call MPI_Cancel(). */
+	i = 0;
+	do
+	::	i == NWORKERS ->
+		break;
+	::	else ->
+		/* I think we could just use MPI_Isend() here. */
+		/*HACK: We should put both requests in a single array so we can use a single MPI_Waitall() call below. */
+		/* NEW: Need to use MPI_BYTE since workers receive all messages using this type now. */
+		MPI_Isend(Pboss, NULL, 0, MPI_BYTE, Pboss->i + 1, MSG_NEWBOUND, Pboss->boundBroadcastRequests + Pboss->i);		/* Was MPI_Issend() */
+		MPI_Isend(Pboss, NULL, 0, MPI_BYTE, Pboss->i + 1, MSG_STEALJOB, Pboss->stealRequestsAndResponses + Pboss->i);		/* Buffer is unimportant */		/* Was MPI_Issend() */
+		i++;
+	od;
+
+	DBGPRINT(("B: Waiting for all final UB updates to be sent.  Final UB = DONTCARE.\n"))
+	MPI_Waitall(Pboss, NWORKERS, Pboss->boundBroadcastRequests, MPI_STATUSES_IGNORE);		/* Don't care about statuses */
+
+	DBGPRINT(("B: Waiting for all dummy steal requests to be sent.\n"))
+	/* NEW: The only reason we loop calling MPI_Waitany() in the C code is (I presume) to
+	 * avoid the need for a large status arrray.  Here, it's surely faster to use a single
+	 * MPI_Waitall() with MPI_STATUSES_IGNORE.  Unfortunately MPI_STATUSES_IGNORE was only
+	 * added in MPI 2 so it makes sense to leave the C code unchanged here. */
+	MPI_Waitall(Pboss, NWORKERS, Pboss->stealRequestsAndResponses, MPI_STATUSES_IGNORE);
+
+	/* Remember, this makes MPI calls to retrieve the trees from each node. */
+	OutputResults();
+
+	/* NEW: Now that we have combined the ASKFORJOB and NEWBOUND receives into a single receive, it's impossible to receive
+	 * a new UB after a worker has been sent a "show's over" message, meaning it no longer makes sense to wait for receipt
+	 * of a "dummy" UB update. */
+
+	DBGPRINT(("B: Done!\n"))
+#ifdef ATOMICBOSS
+	};
+#endif	/* ATOMICBOSS */	
+
+	MPI_Finalize(Pboss);
+END_ACTIVE_MPI_PROC(boss)
+
+/* Instead of actually recording and comparing bounds, we just decide nondeterministically whether
+ * the newly received bound is better.  I believe this is "conservative", i.e. if the model can
+ * be proved correct with this, it will definitely be correct when received bounds are constrained to be decreasing. */
+inline NewBoundReceived() {
+	DBGPRINT(("W%04d: Received bound update of DONTCARE.\n", _pid))
+	if
+	::	true ->		/* I.e. this is one possibility */
+		DBGPRINT(("W%04d: Newly received bound of DONTCARE improves on our previous bound of DONTCARE!\n", _pid))
+		pendingBoundBroadcast = 0;	/* The received UB is better than our own, even after improvements since we last broadcast it */
+	::	skip;		/* And this (doing nothing) is another */
+	fi;
+}
+
+/* This function assumes that it is safe to call MPI_Issend(), i.e. there is not already a MSG_NEWBOUND being */
+/* sent by us that has not completed yet. */
+/* I notice that many of the lines in this function are listed as "unreachable" at the end of a spin run, but inserting
+ * an "assert(0);" in there shows very quickly that they are being run! */
+inline SendNewBound() {
+	assert(pendingBoundBroadcast);
+	DBGPRINT(("W%04d: Sending new bound of DONTCARE.\n", _pid))
+	assert(mpiRequests[WCR_SND_NEWBOUND] == MPI_REQUEST_NULL);
+	/* Length-1 message indicates NEWBOUND. */
+	MPI_Isend(Pworker, &Pworker->ub, 1, MPI_BYTE, 0, MSG_WORKERREQUEST, Pworker->mpiRequests + WCR_SND_NEWBOUND);		/* Was MPI_Issend() */
+	pendingBoundBroadcast = 0;
+}
+
+/* This function assumes that it is safe to call MPI_Issend(), i.e. there is not already a MSG_NEWBOUND being */
+/* sent by us that has not completed yet. */
+inline AskForNewJob() {
+	assert(pendingAskForJob);
+	DBGPRINT(("W%04d: Asking for new job.\n", _pid))
+	/* Length-0 message indicates ASKFORJOB. */
+	MPI_Isend(Pworker, NULL, 0, MPI_BYTE, 0, MSG_WORKERREQUEST, Pworker->mpiRequests + WCR_SND_ASKFORJOB);		/* Was MPI_Issend() */
+	pendingAskForJob = 0;
+}
+
+/* It's possible that we could still use the parameters idx, mpiStatus and waitingForWork,
+ * but I suspect it wouldn't work once these identifiers are used inside MPI calls (which will
+ * cause them to appear inside c_code blocks) -- not sure if spin will handle that.  And
+ * since we use the exact same name for them as in the calling code, might as well just
+ * avoid passing the parameters altogether and use the fact that inline "functions" can see
+ * their caller's local variables!
+ *
+ * And since we can't return values, we require the caller to have a variable "workerMainResult"
+ * which we set. */
+/*inline WorkerMain(waitingForWork) {*/
+/* Instead of bloating the state space with this memory buffer which is used only for sending (because MPI-Spin won't let
+ * us share a single send buffer (which is nitpicking but correct)), we use this hidden array.  Strangely it doesn't seem to actually reduce
+ * the size of a state record.
+ * Also note that since noWork[] is no longer a local variable, we technically need to have NWORKERS distinct copies of it.
+ * Which introduces the need for yet another #defined constant, since Spin doesn't support constant expressions...  Oh well. */
+/* This does get initialised to all zeroes. */
+hidden byte noWork[NWORKERS_SQUARED];
+inline WorkerMain() {
+	byte count;
+	/*byte i;*/				/* The caller declares i already, and doesn't care if we trash it.  (I know, yuck.) */
+	bool flag;
+	
+	skip;			/* Apparently necessary for following label to work...? */
+	
+WorkerMainStart:
+	DBGPRINT(("W%04d: Received instructions.  idx=%d.  waitingForWork=%d\n", _pid, idx, waitingForWork))
+
+	/* NEW: Because we now just use a single MPI_ANY_TAG request for all receives, we need to check the
+	 * tag instead of the index. */
+	if
+	::	idx == WCR_RCV_ALL && mpiStatus.tag == MSG_NEWJOB ->
+		assert(waitingForWork);		/* It should be impossible to receive this message during BranchAndBound(). */
+		MPI_Get_count(&Pworker->mpiStatus, MPI_BYTE, &Pworker->count);
+		if
+		::	count == 1 ->
+			/* We're finished. */
+			DBGPRINT(("W%04d: Boss says we're finished.\n", _pid))
+			workerMainResult = 0;
+			goto returnFromWorkerMain;
+		::	else ->
+			/* More work to do! */
+			DBGPRINT(("W%04d: Received new job of size DONTCARE.\n", _pid))
+
+			/* Repost the receive. */
+			MPI_Irecv(Pworker, &Pworker->workStack, 1, MPI_BYTE, 0, MPI_ANY_TAG, Pworker->mpiRequests + WCR_RCV_ALL);
+
+			/* Although in this model we don't care about computations, we still need to get mpi-spin to nondeterministically allow
+			 * 0 or more steal requests while BranchAndBound() "runs". */
+			/*BranchAndBound(root, 3, td);*/
+WorkerMainAskNewJob:
+			do
+			::	true ->				/* We can do this... */
+				/* Process any steal requests or new bounds that have come up. */
+				flag = 0;
+				/* See the explanation in Worker() for this hack. */
+				if
+				::	nStealsFromUs < NWORKERS ->
+					MPI_Testany(Pworker, NMPIREQUESTS, Pworker->mpiRequests, &Pworker->idx, flag, &Pworker->mpiStatus);
+				::	else ->
+					/* Hold your horses!  We need to wait for a send to complete before doing anything else. */
+					MPI_Testany(Pworker, NMPIREQUESTS - MAX_WCR, Pworker->mpiRequests + MAX_WCR, &Pworker->idx, flag, &Pworker->mpiStatus);
+					if
+					::	flag ->
+						idx = idx + MAX_WCR;
+					::	else		/* Do nothing */
+					fi;
+				fi;
+				
+				if
+				::	flag ->
+					/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+					flag = 0;
+					
+					/*assert(idx != 0);*/		/* It should be impossible to receive a new job at this point. */
+					assert(!(idx == WCR_RCV_ALL && mpiStatus.tag == MSG_NEWJOB));		/* It should be impossible to receive a new job at this point. */
+					
+					/* Since we can't make recursive calls, just jump to the start instead. */
+					waitingForWork = 0;
+					goto WorkerMainStart;
+				::	else		/* Do nothing */
+				fi;
+#ifndef NONEWBOUND
+			::	true ->				/* Or this... */
+				pendingBoundBroadcast = 1;
+				if
+				::	mpiRequests[WCR_SND_NEWBOUND] == MPI_REQUEST_NULL ->
+					SendNewBound();
+				::	else		/* Do nothing */
+				fi;
+#endif	/* not NONEWBOUND */
+			::	true ->				/* Or this... */
+				break;
+			od;
+			
+			/* NEW: Before asking for more work, we must initiate the sending of all pending UBs.  This is needed to guarantee that
+			 * we never initiate a UB send when we already have an outstanding request for work -- since if the boss runs out
+			 * of work, it will then respond to the work request with a "show's over" message and never receive the UB, leading
+			 * to a hang.
+			 *
+			 * All this requires thinking about things more like a finite state machine.  We can only initiate requests for
+			 * work once all UB sends have been initiated.  (Since the non-overtaking property of MPI guarantees that these
+			 * requests will be received in order of *initiation*.  And even though the boss's MPI_Waitsome() might complete both
+			 * receives at the same, UBs are always processed first there, so that's OK.) */
+			
+			/* Record the fact that we need to ask for more work. */
+			/* The semantics of waitingForWork has changed slightly to mean "not in the BandB loop", i.e. we are either
+			 * waiting for a MSG_NEWJOB (as before) OR waiting for UBs to be sent/complete sending so that we can then
+			 * wait for a MSG_NEWJOB. */
+			waitingForWork = 1;
+			pendingAskForJob = 1;
+			
+			/* Use identical logic to handle all three events: (1) running out of work, (2) send of new UB completes, (3) send of request for new work completes. */
+			goto SendNewBoundOrAskForWork;
+		fi;
+	::	idx == WCR_RCV_ALL && mpiStatus.tag == MSG_NEWBOUND ->
+		NewBoundReceived();
+
+		/* Repost the receive. */
+		MPI_Irecv(Pworker, &Pworker->workStack, 1, MPI_BYTE, 0, MPI_ANY_TAG, Pworker->mpiRequests + WCR_RCV_ALL);
+	::	idx == WCR_RCV_ALL && mpiStatus.tag == MSG_STEALJOB ->
+		/* Find the first available post slot and use that. */
+		i = 0;
+		do
+		::	mpiRequests[i + MAX_WCR] != MPI_REQUEST_NULL && i < NWORKERS ->
+			/* Do nothing */
+			i++;
+		::	else ->
+			break;
+		od;
+
+		/* We should have found a slot, because it should not be possible to receive more than td->nWorkers */
+		/* steal requests before the boss waits for a response from us. */
+		assert(i < NWORKERS);
+		assert(!stealBuf[i]);
+
+		/* Need to keep track of the number of outstanding steal responses so that we don't bite off more than we can chew. */
+		nStealsFromUs++;
+		assert(nStealsFromUs <= NWORKERS);
+
+		if
+		::	waitingForWork ->
+			DBGPRINT(("W%04d: Received steal request while waiting for work; will deny it.\n", _pid))
+			/* According to the letter of the MPI law, we need to use distinct buffers for each send from each worker.
+			 * Surprisingly, MPI-Spin apparently doesn't detect when 2 *different* processes share a buffer! */
+			MPI_Isend(Pworker, noWork + ((Pworker->_pid - 1) * NWORKERS) + Pworker->i, 1, MPI_BYTE, 0, MSG_NEWJOB, Pworker->mpiRequests + Pworker->i + MAX_WCR);		/* Was MPI_Issend().  Also original code shares a single noWork unsigned int among all sends. */
+		::	else ->
+			DBGPRINT(("W%04d: Received steal request while working; will satisfy it.\n", _pid))
+			stealBuf[i] = 1;		/* Just flag that this buffer is occupied */
+
+			/* Find a job ;) */
+			/* In the model we don't care how this is done, only that it can be done */
+
+			DBGPRINT(("W%04d: Found a job of size DONTCARE to send back.  Will use slot %d to hold it.\n", _pid, i))
+			/*--td->workStack[j][1];*/				/* Don't care about this in the model */
+			/* In the model, a job is always indicated by a 0-length MSG_NEWJOB message. */
+			MPI_Isend(Pworker, NULL, 0, MPI_BYTE, 0, MSG_NEWJOB, Pworker->mpiRequests + Pworker->i + MAX_WCR);		/* Was MPI_Issend(). */
+		fi;
+		
+		/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+		i = 0;
+
+		/* Repost the receive. */
+		MPI_Irecv(Pworker, &Pworker->workStack, 1, MPI_BYTE, 0, MPI_ANY_TAG, Pworker->mpiRequests + WCR_RCV_ALL);
+	::	idx == WCR_SND_ASKFORJOB || idx == WCR_SND_NEWBOUND ->
+		/* NEW: Either a request for work sent by us has completed, or a new bound we sent has
+		 * completed.  In both cases the action is now actually the same: initiate the next thing
+		 * on our lists.  This must always be sending another UB update if that is pending; it's
+		 * important that we only ask for a new job once all UBs have been sent and the sends
+		 * have completed. */
+		/* MPI will reset the correct MPI_Request to MPI_REQUEST_NULL automatically. */
+		/* We can only have one outstanding bound update at a time, so it's possible that our */
+		/* UB has improved between the last improvement for which a MSG_NEWBOUND was sent by us */
+		/* and receipt of this event. */
+		
+		/* NEW: We now need to do more processing here, since we put off asking for more work until
+		 * all UBs have been sent. */
+SendNewBoundOrAskForWork:
+		idx = 0;
+		ClearStatuses(&Pworker->mpiStatus, 1);
+		
+		if
+		::	pendingBoundBroadcast == 1 ->
+			if
+			::	mpiRequests[WCR_SND_NEWBOUND] == MPI_REQUEST_NULL ->
+				/* Initiate send of new UB */
+				SendNewBound();
+			::	else		/* Do nothing */
+			fi;
+		::	pendingBoundBroadcast == 0 ->
+			/* Not waiting on any UB-related stuff, but we might need to ask for work. */
+			if
+			::	mpiRequests[WCR_SND_ASKFORJOB] == MPI_REQUEST_NULL && pendingAskForJob ->
+				/* It's safe to make the request now. */
+				assert(waitingForWork);			/* pendingAskForJob implies waitingForWork, surely! */
+				AskForNewJob();
+			::	else		/* Do nothing */
+			fi;
+		fi;
+	::	idx >= MAX_WCR ->
+		/* A steal response we sent has completed.  Don't need to do anything -- */
+		/* MPI will reset the correct MPI_Request to MPI_REQUEST_NULL automatically. */
+		assert(mpiRequests[idx] == MPI_REQUEST_NULL);
+		if
+		::	stealBuf[idx - MAX_WCR] ->
+			/* This resulted from a successful steal from us: deallocate the buffer. */
+			/* (A failed steal request does not allocate any buffer.) */
+			stealBuf[idx - MAX_WCR] = 0;
+		::	else		/* Do nothing */
+		fi;
+		nStealsFromUs--;
+	::	else ->
+		/*DBGPRINT(("W%04d: Unexpected event! MPI_ERROR=%d, MPI_SOURCE=%d, MPI_TAG=%d\n", _pid,
+			mpiStatus->MPI_ERROR,
+			mpiStatus->MPI_SOURCE,
+			mpiStatus->MPI_TAG
+		))*/
+		DBGPRINT(("W%04d: Unexpected event!\n", _pid))
+		assert(0);
+	fi;
+	
+	workerMainResult = 1;
+
+returnFromWorkerMain:
+	/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+	idx = 0;
+	/*skip;*/
+	if
+	::	!waitingForWork ->
+		goto WorkerMainAskNewJob;		/* "Return" from the "recursive call" */
+	::	else		/* Do nothing */
+	fi;
+}
+
+BEGIN_ACTIVE_MPI_PROC(worker, NWORKERS)
+	MPI_Request mpiRequests[NMPIREQUESTS];
+	byte nStealsFromUs = 0;
+	byte i;
+	bool stealBuf[NWORKERS_TIMES_2] = 0;
+	bool pendingAskForJob;		/* This is set to 1 before we do anything with it. */
+	bool pendingBoundBroadcast = 0;
+	byte workStack;				/* This is just used for holding a received job, which will either be 1 (a job) or 0 (no job). */
+	/*byte receivedUB;*/		/* We don't actually record the bound, just allow nondeterministically for it to be better or worse than our current bound. */
+	byte idx;
+	MPI_Status mpiStatus;
+	bool workerMainResult;		/* Set by any call to WorkerMain() */
+	bool waitingForWork;		/* This was being passed as a parameter to WorkerMain(), but we can't keep doing that now that we need recursive calls. */
+	byte ub;					/* NEW: This is just a dummy value that we use to send back a new bound.  It never actually changes. */
+	
+	MPI_Init(Pworker, Pworker->_pid);
+	
+	d_step {
+		DBGPRINT(("W%04d: I'm a worker, with rank %d.\n", _pid, _pid))
+		
+		/* Possibly unnecessary but let's be safe. */
+		i = 0;
+		do
+		::	i == NMPIREQUESTS ->
+			break;
+		::	else ->
+			mpiRequests[i] = MPI_REQUEST_NULL;
+			i++;
+		od;
+		
+		/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+		i = 0;
+		ClearStatuses(&Pworker->mpiStatus, 1);
+	}
+	
+	/* Set up outstanding requests. */
+	/* This wastes some space on request types that we don't wait for, but makes the code easier to read and write. */
+	/* NEW: Instead of 3 separate receives, try posting a single one with MPI_ANY_TAG -- this should guarantee that messages sent
+	 * arrive in order, which is necessary so we know whether a given MSG_NEWBOUND was sent before or after the final length-1
+	 * MSG_NEWJOB.  Note that we still don't care about the actual bound sent with MSG_NEWBOUND -- we use a 0-length message here for that. */
+	MPI_Irecv(Pworker, &Pworker->workStack, 1, MPI_BYTE, 0, MPI_ANY_TAG, Pworker->mpiRequests + WCR_RCV_ALL);
+	
+	/* Ask for work. */
+	pendingAskForJob = 1;
+	AskForNewJob();
+	
+	d_step {
+		/* Initialise slot for completion of sending a bound update.  There can be at most 1 outstanding */
+		/* bound update at a time. */
+		mpiRequests[WCR_SND_NEWBOUND] = MPI_REQUEST_NULL;
+		
+		/* Initialise slots for handling completion of send requests (e.g. responses to steal attempts) */
+		i = 0;
+		do
+		::	i == NWORKERS ->
+			break;
+		::	else ->
+			mpiRequests[i + MAX_WCR] = MPI_REQUEST_NULL;			/* Will be used for sending back stolen jobs later. */
+			i++;
+		od;
+		
+		/* Resetting variables when they aren't needed anymore will hopefully reduce the size of the state space */
+		i = 0;
+	}
+	
+	do
+	::	true ->		/* I.e. this is a "while (1) { ... }" loop */
+		/*HACK: We could make the following slightly more efficient by remembering what the highest-numbered in-use */
+		/* request is, and only waiting on that many requests. */
+		DBGPRINT(("W%04d: Waiting for instructions.\n", _pid))
+		/* There is a tricky race condition whereby if everyone has stolen from us, if we're not careful we can */
+		/* accidentally start processing another steal request from the next round of steals before waiting on */
+		/* our sends of stolen jobs to complete, meaning there won't be any slots free!  If we have any outstanding */
+		/* sends of stolen jobs, we can wait on them without deadlocking, so let's do that. */
+		if
+		::	nStealsFromUs < NWORKERS ->
+			MPI_Waitany(Pworker, NMPIREQUESTS, Pworker->mpiRequests, &Pworker->idx, &Pworker->mpiStatus);
+		::	else ->
+			/* Hold your horses!  We need to wait for a send to complete before doing anything else. */
+			MPI_Waitany(Pworker, NMPIREQUESTS - MAX_WCR, Pworker->mpiRequests + MAX_WCR, &Pworker->idx, &Pworker->mpiStatus);
+			idx = idx + MAX_WCR;
+		fi;
+
+		waitingForWork = 1;		/* This was being passed as a parameter, but we can't keep doing that now that we need recursive calls. */
+		WorkerMain();		/* We use the fact that idx and mpiStatus are in scope in WorkerMain() to avoid passing them explicitly.  Result goes in workerMainResult. */
+		if
+		::	!workerMainResult ->
+			break;
+		::	else		/* Do nothing */
+		fi;
+	od;
+
+	/* Although we could omit the special-case waiting for the final bound and steal requests since */
+	/* they will be waited on by the final MPI_Waitall() that waits for outstanding sends to complete, */
+	/* it may simplify debugging to wait on them separately, and the performance penalty is tiny. */
+	DBGPRINT(("W%04d: Waiting for final bound update.\n", _pid))
+	MPI_Irecv(Pworker, &Pworker->workStack, 1, MPI_BYTE, 0, MPI_ANY_TAG, Pworker->mpiRequests + WCR_RCV_ALL);
+	MPI_Wait(Pworker, Pworker->mpiRequests + WCR_RCV_ALL, &Pworker->mpiStatus);
+	DBGPRINT(("W%04d: mpiStatus.tag=%d\n", _pid, mpiStatus.tag))		/*DEBUG*/
+	assert(mpiStatus.tag == MSG_NEWBOUND);
+	NewBoundReceived();
+
+	DBGPRINT(("W%04d: Waiting for final (dummy) steal request.\n", _pid))
+	MPI_Irecv(Pworker, &Pworker->workStack, 1, MPI_BYTE, 0, MPI_ANY_TAG, Pworker->mpiRequests + WCR_RCV_ALL);
+	MPI_Wait(Pworker, Pworker->mpiRequests + WCR_RCV_ALL, &Pworker->mpiStatus);
+
+	DBGPRINT(("W%04d: Waiting for any outstanding sends to complete.\n", _pid))
+	/* I guess we don't care about these statuses... */
+	MPI_Waitall(Pworker, NMPIREQUESTS, Pworker->mpiRequests, MPI_STATUSES_IGNORE);
+
+#ifdef SIMPLEOUTPUTRESULTS
+	/* A simpler variant. */
+	DBGPRINT(("W%04d: Sending back 1 byte's worth of trees.\n", _pid))
+	MPI_Send(Pworker, NULL, 0, MPI_POINT, 0, MSG_TREES);		/* Was MPI_Ssend() */
+#else	/* not SIMPLEOUTPUTRESULTS */
+	/* It's conservative to nondeterministically decide how much data to send back. */
+	/*TODO: Add cases for 3 and 4 bytes.  Sadly this means we depend on TREEBUFSIZE == 2. */
+	byte treeBuf[TREEBUFSIZE];
+	assert(TREEBUFSIZE == 2);		/* Following if statement depends on this */
+	if
+	::	true ->		/* We can try sending back 1 byte's worth of trees */
+		DBGPRINT(("W%04d: Sending back 1 byte's worth of trees.\n", _pid))
+		MPI_Send(Pworker, Pworker->treeBuf, 1, MPI_BYTE, 0, MSG_TREES);		/* Was MPI_Ssend() */
+	::	true ->		/* We can try sending back 2 bytes' worth of trees */
+		DBGPRINT(("W%04d: Sending back 2 bytes' worth of trees.\n", _pid))
+		MPI_Send(Pworker, Pworker->treeBuf, 2, MPI_BYTE, 0, MSG_TREES);		/* Was MPI_Ssend() */
+		MPI_Send(Pworker, Pworker->treeBuf, 0, MPI_BYTE, 0, MSG_TREES);		/* Was MPI_Ssend() */	/* IMPORTANT!  Need to send a 0-byte block to signal the end! */
+	::	true ->		/* We can try sending back 0 bytes' worth of trees (corresponding to the else clause in the C code) */
+		/* No trees to send. */
+		DBGPRINT(("W%04d: No temporary tree file, so no trees to send back the boss.\n", _pid))
+		MPI_Send(Pworker, Pworker->treeBuf, 0, MPI_BYTE, 0, MSG_TREES);		/* Was MPI_Ssend() */
+	fi;
+#endif	/* not SIMPLEOUTPUTRESULTS */
+
+	/* NEW: We no longer need to (nor should we) do this, now that all requests from workers use MSG_WORKERREQUEST. */
+
+	DBGPRINT(("W%04d: Done!\n", _pid))
+	
+	MPI_Finalize(Pworker);
+END_ACTIVE_MPI_PROC(worker)
+
+ACTIVE_MPI_DAEMON

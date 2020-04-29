@@ -1,0 +1,14 @@
+Fixing the C code
+
+Model revisions outstanding (starting from rev 471):
+
+474: 492
+475,476,477: 493
+479: 501
+481: 502
+482: 503
+483: 504
+484: 506
+485: 507
+
+Additional changes required by the C code but not by the Promela model: 509, 516 (these were later added to the model in 517)

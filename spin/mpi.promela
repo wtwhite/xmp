@@ -1,0 +1,331 @@
+/* Global variables */
+#define NPROCS 4
+#define MAXREQS 6
+#define MAXTAGS 3
+#define CHANSIZE 2			/* Maximum number of in-flight messages of a given tag between 2 given processes */
+#define MPICHANSIZE 6		/* Maximum number of paired sends and receives awaiting completion by the MPI daemon */
+
+byte rankOf[NPROCS];		/* Maps process IDs to MPI ranks. */
+byte reqState[MAXREQS];		/* 0 => null/completed; 1 => send in progress; 2 => receive in progress; 255 => signalled */
+byte recvCount[MAXREQS];	/* The received message size for receive requests. */
+
+typedef arrayOfChannels {
+	chan byTag[MAXTAGS] = [CHANSIZE] of { byte, byte };
+};
+
+typedef arrayOfArraysOfChannels {
+	arrayOfChannels byMate[NPROCS];
+};
+
+/* sends[x].byMate[y].byTag[z] is a channel containing all messages sent by
+ * proc x to proc y using tag z.  recvs works similarly. */
+arrayOfArraysOfChannels sends[NPROCS];
+arrayOfArraysOfChannels recvs[NPROCS];
+
+/* Keeps a queue of paired sends and receives awaiting completion by the MPI daemon */
+chan mpi_chan = [MPICHANSIZE] of { byte, byte, byte, byte, byte, byte };
+
+/* MPI_Issend()
+ * We omit the buf, datatype and communicator parameters -- count will serve
+ * the purpose of both the size of the message and its content.  This way we
+ * can verify that the receive's count is >= the send's, without a huge
+ * proliferation of state.
+ *
+ * recvReq is just the name of a local variable to use to hold the (discovered)
+ * receive request number, if it exists.  This parameter exists only because
+ * spin doesn't allow creation of scope-local variables. */
+inline MPI_Issend(count, dest, tag, req, recvReq) {
+	atomic {
+		d_step {
+			assert(reqState[req] == 0);		/* Don't re-use in-use comm. obj. */
+			reqState[req] = 1;
+			
+			/* Ideally we would have an infinite channel capacity for this, but in
+			 * practice it has to be limited. */
+			assert(nfull(sends[rankOf[_pid]].byMate[dest].byTag[tag]));
+		}
+		
+		/* Has a matching receive already been posted?
+		 * Yes, spin complains about using an "else" from the same state as
+		 * a communication operation (presumably "nempty(...)" here), but I'm
+		 * convinced this is fine.  We're in an atomic block after all. */
+		if
+		::	recvs[dest].byMate[rankOf[_pid]].byTag[tag] ? recvReq, _;		/* TODO: for now, we discard the read count. */
+			
+			/* Alert the MPI daemon that a communication is completeable */
+			mpi_chan ! rankOf[_pid], dest, tag, count, req, recvReq;
+		::	else
+			/* The receive will handle things when it is posted. */
+			sends[rankOf[_pid]].byMate[dest].byTag[tag] ! req, count;
+		fi
+	}
+}
+
+/* See the description for MPI_Issend().
+ *
+ * sendReq and sendCount are just the names of local variables to use. */
+inline MPI_Irecv(count, src, tag, req, sendReq, sendCount) {
+	atomic {
+		d_step {
+			assert(reqState[req] == 0);		/* Don't re-use in-use comm. obj. */
+			reqState[req] = 2;
+			
+			/* Ideally we would have an infinite channel capacity for this, but in
+			 * practice it has to be limited. */
+			assert(nfull(recvs[rankOf[_pid]].byMate[src].byTag[tag]));
+		}
+		
+		/* Has a matching receive already been posted?
+		 * Yes, spin complains about using an "else" from the same state as
+		 * a communication operation (presumably "nempty(...)" here), but I'm
+		 * convinced this is fine.  We're in an atomic block after all. */
+		if
+		::	sends[src].byMate[rankOf[_pid]].byTag[tag] ? sendReq, sendCount;
+			
+			/* Alert the MPI daemon that a communication is completeable */
+			mpi_chan ! src, rankOf[_pid], tag, sendCount, sendReq, req;
+		::	else
+			/* The send will handle things when it is posted. */
+			recvs[rankOf[_pid]].byMate[src].byTag[tag] ! req, req;		/* TODO: Replace dummy 2nd "req" here with count, so mpi_daemon() can check it is >= the send's. */
+		fi
+	}
+}
+
+/* Wait until the given request has completed. */
+inline MPI_Wait(req) {
+	/* Although http://spinroot.com/spin/Man/d_step.html says that it is not
+	 * allowed for *any* statement within a d_step to block,
+	 * http://spinroot.com/spin/Man/Quick.html makes it clear that just like for
+	 * atomic, the first statement may block.  Which makes sense. */
+	d_step {
+		reqState[req] == 255;		/* Blocks (behaves like a guard). */
+		reqState[req] = 0;
+	}
+}
+
+/* Wait until all requests in the given range have completed.
+ * Using a single large do ... od block would probably be faster than spawning
+ * a ton of processes I think, but means you have to know how many there are
+ * at compile time.
+ *
+ * channel is a (local or global) channel.  It must be of type chan [0] of byte.
+ * (You could actually use a buffered channel, but this would only increase
+ * the number of possible states unnecessarily.)
+ *
+ * n is a local byte scratch variable. */
+inline MPI_Waitall(firstReq, lastReq, channel, n) {
+	d_step {
+		assert(empty(channel));
+		n = lastReq - firstReq + 1;
+	}
+	
+	run spawn_wait_all(firstReq, lastReq, channel);
+	
+	do
+	::	n > 0 ->
+		atomic {
+			channel ? _;
+			n--;
+		}
+	::	n == 0 -> break;
+	od
+}
+
+/* Recursively spawn as many processes as necessary.  Each waits on a single
+ * request. */
+proctype spawn_wait_all(byte firstReq; byte lastReq; chan channel) {
+	atomic {
+		if
+		::	firstReq < lastReq ->
+			run spawn_wait_all(firstReq + 1, lastReq, channel);
+		::	else skip;
+		fi
+	}
+	
+	atomic {
+		MPI_Wait(firstReq);
+		channel ! firstReq;
+	}
+}
+
+/* Wait until any one of the requests in the given range have completed.
+ * Using a single large if ... fi block would probably be faster than spawning
+ * a ton of processes I think, but means you have to know how many there are
+ * at compile time.
+ *
+ * The (local or global) variable which is set to the completed request.
+ *
+ * channel is a (local or global) channel.  It must be of type chan [1] of byte.
+ *
+ * n is a local byte scratch variable. */
+inline MPI_Waitany(firstReq, lastReq, which, channel, n) {
+	d_step {
+		assert(empty(channel));
+		n = lastReq - firstReq + 1;
+	}
+	
+	run spawn_wait_any(firstReq, lastReq, channel);
+	
+	atomic {
+		/* Grab the first one */
+		channel ? which;
+		
+		/* Begin cleaning up.  It's crucial to keep the channel full now,
+		 * hence the atomic { ... }. */
+		channel ! firstReq;
+	}
+	
+	/* The following atomic { ... } is critical -- we need to keep the channel
+	 * full at all times, otherwise a second communication completing
+	 * concurrently can cause a second spawned process to match its first
+	 * guard (channel empty and communication complete). */
+	atomic {
+		channel ? eval(which);		/* This process already died, so step in for it */
+		channel ! which + 1;
+	}
+	
+	channel ? eval(lastReq + 1);		/* Indicates the final process has completed. */
+}
+
+/* Recursively spawn as many processes as necessary.  Each waits on a single
+ * request. */
+proctype spawn_wait_any(byte firstReq; byte lastReq; chan channel) {
+	atomic {
+		if
+		::	firstReq < lastReq ->
+			run spawn_wait_any(firstReq + 1, lastReq, channel);
+		::	else skip;
+		fi
+	}
+	
+	/* Exactly one of the spawned processes will eventually execute the top
+	 * branch...  I think... */
+	if
+	::	atomic {
+			empty(channel) && reqState[firstReq] == 255 ->
+			reqState[firstReq] = 0;
+			channel ! firstReq;
+		}
+	::	atomic {
+			channel ? eval(firstReq) ->		/* I.e. read only if it matches the request we're looking at */
+			channel ! firstReq + 1;			/* Tell the next guy */
+		}
+	fi
+}
+
+/* (Dramatically) faster special case of MPI_Waitany() for just 2 requests.
+ * Obviously this could, and probably should, be generalised via some
+ * kind of templating system.  Perl maybe? */
+inline MPI_Waitany2(firstReq, lastReq, which) {
+	assert(firstReq + 1 == lastReq);		/* Sanity check that is actually unnecessarily limiting, but what the hell. */
+	
+	if
+	::	MPI_Wait(firstReq) ->
+		which = firstReq;
+	::	MPI_Wait(lastReq) ->
+		which = lastReq;
+	fi
+}
+
+/* This process matches sends to receives.  Well, actually, either the send or
+ * receive itself (whichever is performed 2nd) does the matching -- this process
+ * just ensures that the communication is actually executed sometime after this
+ * happens, with the send and receive completing in arbitrary order. */
+active [1] proctype mpi_daemon() {
+	bool sendCompleted, recvCompleted;
+	byte src, dest, tag, count, sendReq, recvReq;
+	xr mpi_chan;
+	
+end:
+	do
+	::	mpi_chan ? src, dest, tag, count, sendReq, recvReq ->
+		d_step {
+			assert(reqState[sendReq] == 1);
+			assert(reqState[recvReq] == 2);
+			recvCount[recvReq] = count;			/* Send the "data" */
+			sendCompleted = false;
+			recvCompleted = false;
+		}
+		
+		/* Trigger send and receive completion in no particular order */
+		do
+		::	d_step {
+				!sendCompleted ->
+				reqState[sendReq] = 255;
+				sendCompleted = true;
+			}
+		::	d_step {
+				!recvCompleted ->
+				reqState[recvReq] = 255;
+				recvCompleted = true;
+			}
+		::	else ->
+			break;
+		od
+	od
+}
+
+#define MSG_ASKFORJOB 0
+
+proctype Boss() {
+	byte sendReq, sendCount;	/* Local variables used by MPI_...() */
+	/*chan waitAllChannel = [0] of { byte };*/
+	chan waitAnyChannel = [1] of { byte };
+	byte n;
+	byte which;
+	
+	d_step {
+		rankOf[_pid] = 0;		/* Boss always has rank 0 */
+		printf("I'm the Boss.\n");
+	}
+	
+	MPI_Irecv(50, 1, MSG_ASKFORJOB, 0, sendReq, sendCount);
+	printf("B: Posted a receive for a 50-byte message from W1.\n");
+	MPI_Irecv(100, 1, MSG_ASKFORJOB, 1, sendReq, sendCount);
+	printf("B: Posted a receive for a 100-byte message from W1.\n");
+	/*MPI_Waitall(0, 1, waitAllChannel, n);*/
+	/*MPI_Wait(0);
+	MPI_Wait(1);*/
+	/*MPI_Waitany(0, 1, which, waitAnyChannel, n);
+	MPI_Waitany(0, 1, which, waitAnyChannel, n);*/
+	MPI_Waitany2(0, 1, which);
+	MPI_Waitany2(0, 1, which);
+	d_step {
+		printf("B: Both receives have completed.  Messages were %d and %d bytes long.\n", recvCount[0], recvCount[1]);
+		assert(recvCount[0] == 50);
+		assert(recvCount[1] == 100);
+	}
+}
+
+proctype Worker(byte rank) {
+	byte recvReq;		/* Local variables used by MPI_...() */
+	/*chan waitAllChannel = [0] of { byte };*/
+	chan waitAnyChannel = [1] of { byte };
+	byte n;
+	byte which;
+	
+	d_step {
+		rankOf[_pid] = rank;
+		printf("I'm a Worker with rank %d.\n", rank);
+	}
+	
+	MPI_Issend(50, 0, MSG_ASKFORJOB, 2, recvReq);
+	printf("W%d: Sent a 50-byte message to B.\n", rank);
+	MPI_Issend(100, 0, MSG_ASKFORJOB, 3, recvReq);
+	printf("W%d: Sent a 100-byte message to B.\n", rank);
+	/*MPI_Waitall(2, 3, waitAllChannel, n);*/
+	/*MPI_Wait(2);
+	MPI_Wait(3);*/
+	/*MPI_Waitany(2, 3, which, waitAnyChannel, n);
+	MPI_Waitany(2, 3, which, waitAnyChannel, n);*/
+	MPI_Waitany2(2, 3, which);
+	MPI_Waitany2(2, 3, which);
+	printf("W%d: Both sends have completed.\n", rank);
+}
+
+init {
+	atomic {
+		run Boss();
+		run Worker(1);
+	}
+}
