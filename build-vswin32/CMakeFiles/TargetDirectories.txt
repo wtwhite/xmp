@@ -1,0 +1,3 @@
+C:/WTJW/parallel_parsimony/build-vswin32/CMakeFiles/ALL_BUILD.dir
+C:/WTJW/parallel_parsimony/build-vswin32/CMakeFiles/ZERO_CHECK.dir
+C:/WTJW/parallel_parsimony/build-vswin32/CMakeFiles/fastdnamp.dir

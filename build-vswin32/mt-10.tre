@@ -1,0 +1,17 @@
+#NEXUS
+[ Trees produced by fastDNAmp: Exact Maximum Parsimony Phylogenetic Tree Search v1.1
+> Each tree has score 16179. ]
+BEGIN TREES;
+	TRANSLATE
+		1	Rat,
+		2	Mouse,
+		3	Dormouse,
+		4	GuineaPig,
+		5	Rabbit,
+		6	Armadillo,
+		7	Hedgehog,
+		8	Aardvark,
+		9	WhiteRhino,
+		10	Horse;
+	TREE FASTDNAMP_1 = [&U] (1,(2,(7,((5,((6,8),(10,9))),(3,4)))));
+END;

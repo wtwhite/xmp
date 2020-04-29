@@ -1,0 +1,26 @@
+# CMake generation dependency list for this directory.
+C:/WTJW/parallel_parsimony/src/CMakeLists.txt
+C:/WTJW/parallel_parsimony/build-vswin32/CMakeFiles/CMakeSystem.cmake
+C:/WTJW/parallel_parsimony/build-vswin32/CMakeFiles/CMakeCCompiler.cmake
+C:/WTJW/parallel_parsimony/build-vswin32/CMakeFiles/CMakeCXXCompiler.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CMakeSystemSpecificInformation.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CMakeGenericSystem.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/Platform/gcc.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/Platform/Windows.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/Platform/WindowsPaths.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CMakeCInformation.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/Platform/Windows-cl.cmake
+C:/WTJW/parallel_parsimony/build-vswin32/CMakeFiles/CMakeCPlatform.cmake
+C:/WTJW/parallel_parsimony/build-vswin32/CMakeFiles/CMakeCXXPlatform.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/Platform/cl.cmake
+C:/WTJW/parallel_parsimony/build-vswin32/CMakeFiles/CMakeRCCompiler.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CMakeRCInformation.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CMakeCommonLanguageInclude.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CMakeCXXInformation.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CMakeCommonLanguageInclude.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CheckCSourceCompiles.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/TestBigEndian.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CheckIncludeFiles.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CheckTypeSize.cmake
+C:/Program Files/CMake 2.8/share/cmake-2.8/Modules/CheckIncludeFile.cmake
+C:/WTJW/parallel_parsimony/src/switches.h.in
