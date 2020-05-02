@@ -10,6 +10,12 @@ IF(NOT DEFINED USEFUL_LIBS_INCLUDE_DIR)
 	ENDIF(IS_DIRECTORY ${CMAKE_SOURCE_DIR}/../useful_libs)
 ENDIF(NOT DEFINED USEFUL_LIBS_INCLUDE_DIR)
 
+IF(NOT DEFINED USEFUL_LIBS_INCLUDE_DIR)
+	IF(IS_DIRECTORY ${CMAKE_SOURCE_DIR}/../../useful_libs)
+		SET(USEFUL_LIBS_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/../../useful_libs/include CACHE FILEPATH "Include directory for useful_libs")
+	ENDIF(IS_DIRECTORY ${CMAKE_SOURCE_DIR}/../../useful_libs)
+ENDIF(NOT DEFINED USEFUL_LIBS_INCLUDE_DIR)
+
 #HACK: Do the same thing for libs?  Harder though.
 
 #HACK: Need to incorporate paths to my libraries better somehow...
