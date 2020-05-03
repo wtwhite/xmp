@@ -4,6 +4,7 @@ CMAKE_MINIMUM_REQUIRED(VERSION 2.6)
 
 INCLUDE(CheckCSourceCompiles)		# Used by several things
 
+# Look for useful_libs beneath the repo root, and as a sibling of it.
 IF(NOT DEFINED USEFUL_LIBS_INCLUDE_DIR)
 	IF(IS_DIRECTORY ${CMAKE_SOURCE_DIR}/../useful_libs)
 		SET(USEFUL_LIBS_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/../useful_libs/include CACHE FILEPATH "Include directory for useful_libs")
@@ -15,6 +16,18 @@ IF(NOT DEFINED USEFUL_LIBS_INCLUDE_DIR)
 		SET(USEFUL_LIBS_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/../../useful_libs/include CACHE FILEPATH "Include directory for useful_libs")
 	ENDIF(IS_DIRECTORY ${CMAKE_SOURCE_DIR}/../../useful_libs)
 ENDIF(NOT DEFINED USEFUL_LIBS_INCLUDE_DIR)
+
+IF(NOT DEFINED USEFUL_LIBS_LIB_DIR)
+	IF(IS_DIRECTORY ${CMAKE_SOURCE_DIR}/../useful_libs)
+		SET(USEFUL_LIBS_LIB_DIR ${CMAKE_SOURCE_DIR}/../useful_libs/lib CACHE FILEPATH "Library directory for useful_libs")
+	ENDIF(IS_DIRECTORY ${CMAKE_SOURCE_DIR}/../useful_libs)
+ENDIF(NOT DEFINED USEFUL_LIBS_LIB_DIR)
+
+IF(NOT DEFINED USEFUL_LIBS_LIB_DIR)
+	IF(IS_DIRECTORY ${CMAKE_SOURCE_DIR}/../../useful_libs)
+		SET(USEFUL_LIBS_LIB_DIR ${CMAKE_SOURCE_DIR}/../../useful_libs/lib CACHE FILEPATH "Library directory for useful_libs")
+	ENDIF(IS_DIRECTORY ${CMAKE_SOURCE_DIR}/../../useful_libs)
+ENDIF(NOT DEFINED USEFUL_LIBS_LIB_DIR)
 
 #HACK: Do the same thing for libs?  Harder though.
 
