@@ -872,7 +872,7 @@ void SpliceIn(struct tree *t, struct tree *host, struct tbr_context *ctx) {
 		UpdateBelowTbr(t, ctx);
 	}
 
-	UpdateAboveTbr(newNode->nodes[PARENT], ISIBLING(newNode->nodes[PARENT]), ctx);
+	UpdateAboveTbr(newNode->nodes[PARENT], iSibling, ctx);
 
 	// We have pointed other nodes at these sequences so we need to get fresh memory for them to avoid aliasing.
 	host->seqsByTreeSize[ctx->nTaxa].seqs[DOWN] = ArenaAllocate(&ctx->tbrMem, ctx->seqLenBlocks * BYTESPERBLOCK);		//TODO: Scavenge existing mem
