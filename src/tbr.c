@@ -634,6 +634,8 @@ void CutAt(struct tree *t, struct tbr_context *ctx) {
 	);
 
 	DBGPRINT2("EnumCuts(): Cutting an edge with weight %u.\n", ctx->oldEdgeScore);
+	DBGPRINT2("Original score of entire tree before cut: %u\n", FitchScoreTree(ctx->root, ctx));
+
 #ifdef DEBUG
 	DBGPRINT1("Full tree: ");
 	PrintTree(ctx->root, ctx->td, dbgfile);
@@ -642,11 +644,9 @@ void CutAt(struct tree *t, struct tbr_context *ctx) {
 	DBGPRINT1("Tree below this edge: ");
 	PrintTree(t, ctx->td, dbgfile);
 	DBGPRINT1(";\n");
-#endif	//DEBUG
-
-	DBGPRINT2("Original score of entire tree before cut: %u\n", FitchScoreTree(ctx->root, ctx));
 
 	assert(VerifyTreeSeqs(ctx->root, ctx, &edgeCount));
+#endif	//DEBUG
 
 	ctx->cut = t;
 	ctx->elbow = t->nodes[PARENT];
