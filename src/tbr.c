@@ -3,6 +3,7 @@
 #include "yanbader.h"
 #include <dbgprint.h>
 #include "arena.h"
+#include <limits.h>
 
 // Although we only need a single sequence triple per node rather than an array of them, rather than define a new and marginally different struct, we just use struct tree, with
 // seqsByTreeSize[] containing a single element.

@@ -3,6 +3,7 @@
 #include "seq.h"
 #include "yanbader.h"
 #include <dbgprint.h>
+#include <limits.h>
 
 struct greedy_context {
 	unsigned bestScoreIncrease;
