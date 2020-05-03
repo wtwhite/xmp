@@ -906,7 +906,7 @@ void TreeBisectionReconnection(struct tree *root, struct TreeData *td) {
 	struct tree *elbow;
 	struct tree *sibling;
 	struct tree *lowerRoot;
-	const int slack = 1;	// The number of additional sequences our memory arena should accommodate.  At least 1 is needed for the Verify...Seqs() routines.
+	const int slack = 1 + 9;	// The number of additional sequences our memory arena should accommodate.  At least 1 is needed for the Verify...Seqs() routines, and 9 are needed by SpliceIn().
 
 	ctx.bestCut = NULL;
 	ctx.bestAbove = NULL;
@@ -929,7 +929,7 @@ void TreeBisectionReconnection(struct tree *root, struct TreeData *td) {
 	ArenaCreate(&ctx.tbrMem,
 		//(ctx.nTaxa * 2 - 3) * ((ctx.nTaxa + 1) * sizeof (struct edge_seqs)) +			// Don't need to allocate this as we actually use what has already been allocated
 		((ctx.nTaxa - 3) * 3 + ctx.nTaxa * 2 + slack) * (ctx.seqLenBlocks * BYTESPERBLOCK) +		// For sequence data.
-		UROUNDUP(sizeof(struct edge_seqs) * (ctx.nTaxa + 1), BYTESPERBLOCK)		// Needed by RerootTreeAbove().
+		2 * UROUNDUP(sizeof(struct edge_seqs) * (ctx.nTaxa + 1), BYTESPERBLOCK)		// 1 needed by RerootTreeAbove(), 1 needed by SpliceIn().
 	);
 	DeepCopyTreeSeqs(root, &ctx);
 
