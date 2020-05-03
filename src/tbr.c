@@ -928,7 +928,8 @@ void TreeBisectionReconnection(struct tree *root, struct TreeData *td) {
 	// We should only need a small fixed number of sequences on top of that for shuffling around or local operations.
 	ArenaCreate(&ctx.tbrMem,
 		//(ctx.nTaxa * 2 - 3) * ((ctx.nTaxa + 1) * sizeof (struct edge_seqs)) +			// Don't need to allocate this as we actually use what has already been allocated
-		((ctx.nTaxa - 3) * 3 + ctx.nTaxa * 2 + slack) * (ctx.seqLenBlocks * BYTESPERBLOCK)		// For sequence data.
+		((ctx.nTaxa - 3) * 3 + ctx.nTaxa * 2 + slack) * (ctx.seqLenBlocks * BYTESPERBLOCK) +		// For sequence data.
+		UROUNDUP(sizeof(struct edge_seqs) * (ctx.nTaxa + 1), BYTESPERBLOCK)		// Needed by RerootTreeAbove().
 	);
 	DeepCopyTreeSeqs(root, &ctx);
 
